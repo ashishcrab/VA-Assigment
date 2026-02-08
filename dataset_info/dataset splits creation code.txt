@@ -1,0 +1,361 @@
+Following code used to generate the splits inline with original UCF-101 splits.
+
+
+import os
+import glob
+import json
+from collections import defaultdict
+from typing import List, Tuple
+import numpy as np
+from datetime import datetime
+
+# =======================
+# Configuration
+# =======================
+DATA_ROOT = "Dataset_DL"  # set to your dataset root containing class folders and 'splits' folder to be created
+SPLITS_DIR = os.path.join(DATA_ROOT, "splits")
+VIDEO_EXTS = (".mp4", ".avi", ".mov", ".mkv")
+
+# Ratios must sum to 1.0 (or very close)
+TRAIN_RATIO = 0.7
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+
+RANDOM_STATE = 42  # reproducible shuffling
+
+
+# =======================
+# Helpers
+# =======================
+def list_class_dirs(data_root: str) -> List[str]:
+    # List only class directories (exclude 'splits' and hidden/system dirs)
+    dirs = []
+    for d in os.listdir(data_root):
+        full = os.path.join(data_root, d)
+        if not os.path.isdir(full):
+            continue
+        if d.lower() == "splits":
+            continue
+        if d.startswith(".") or d.startswith("_"):
+            continue
+        dirs.append(d)
+    return sorted(dirs)
+
+
+def list_videos_for_class(data_root: str, class_name: str, exts=VIDEO_EXTS) -> List[str]:
+    class_dir = os.path.join(data_root, class_name)
+    files = []
+    for e in exts:
+        files.extend(glob.glob(os.path.join(class_dir, f"*{e}")))
+    # Return paths relative to DATA_ROOT (for clean split files)
+    rel_paths = [os.path.relpath(f, data_root).replace("\\", "/") for f in files]
+    return sorted(rel_paths)
+
+
+def stratified_split_per_class(
+    items: List[str],
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    rng: np.random.Generator
+) -> Tuple[List[str], List[str], List[str]]:
+    items = items.copy()
+    rng.shuffle(items)
+    n = len(items)
+    if n == 0:
+        return [], [], []
+
+    n_train = int(round(n * train_ratio))
+    n_val = int(round(n * val_ratio))
+    n_test = n - n_train - n_val
+
+    # Fix rounding and ensure feasibility
+    if n_test < 0:
+        n_test = 0
+        n_val = min(n_val, n)
+        n_train = n - n_val - n_test
+
+    # Try to keep at least 1 in val/test when feasible (n >= 3)
+    if n >= 3 and n_test == 0:
+        if n_train > 1:
+            n_train -= 1
+            n_test += 1
+        elif n_val > 1:
+            n_val -= 1
+            n_test += 1
+
+    if n >= 3 and n_val == 0:
+        if n_train > 1:
+            n_train -= 1
+            n_val += 1
+        elif n_test > 1:
+            n_test -= 1
+            n_val += 1
+
+    if n_train < 0 or n_val < 0 or n_test < 0 or (n_train + n_val + n_test != n):
+        # Fallback conservative split
+        n_train, n_val, n_test = n, 0, 0
+        if n >= 2:
+            n_val = 1
+            n_train -= 1
+        if n >= 3:
+            n_test = 1
+            n_train -= 1
+
+    train_items = items[:n_train]
+    val_items = items[n_train:n_train + n_val]
+    test_items = items[n_train + n_val:]
+    return train_items, val_items, test_items
+
+
+def write_split_file(path: str, rows: List[Tuple[str, int]]):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for rel_path, label in rows:
+            f.write(f"{rel_path} {label}\n")
+
+
+def build_dataset_info(
+    classes: List[str],
+    class_to_idx: dict,
+    per_class_counts: dict,
+    split_counts: dict
+):
+    info = {
+        "classes": classes,
+        "class_to_index": class_to_idx,
+        "per_class_total_counts": per_class_counts,
+        "split_counts": split_counts,
+        "notes": "Split files contain: '<relative_path> <label_index>' per line."
+    }
+    return info
+
+
+def read_split_file(split_file: str) -> List[Tuple[str, int]]:
+    rows = []
+    with open(split_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                raise ValueError(f"Invalid line in {split_file}: '{line}'")
+            rel_path = parts[0]
+            label = int(parts[1])
+            rows.append((rel_path, label))
+    return rows
+
+
+def verify_no_overlap(train_rows, val_rows, test_rows):
+    def only_paths(rows): return set([p for p, _ in rows])
+    a, b, c = only_paths(train_rows), only_paths(val_rows), only_paths(test_rows)
+    overlap = (a & b) | (a & c) | (b & c)
+    if overlap:
+        raise RuntimeError(f"Overlap detected across splits: {list(overlap)[:5]} ...")
+    print("No overlap across splits.")
+
+
+# =======================
+# README generation
+# =======================
+def _head(path, n=5):
+    lines = []
+    if not os.path.isfile(path):
+        return lines
+    with open(path, "r", encoding="utf-8") as f:
+        for i, line in enumerate(f):
+            if i >= n:
+                break
+            lines.append(line.rstrip("\n"))
+    return lines
+
+
+def create_readme(data_root: str, splits_dir: str, info_file: str = "dataset_info.txt"):
+    info_path = os.path.join(data_root, info_file)
+    if not os.path.isfile(info_path):
+        raise FileNotFoundError(f"{info_path} not found. Run the split script first to create dataset_info.txt")
+
+    with open(info_path, "r", encoding="utf-8") as f:
+        info = json.load(f)
+
+    classes = info.get("classes", [])
+    class_to_idx = info.get("class_to_index", {})
+    per_class_total = info.get("per_class_total_counts", {})
+    split_counts = info.get("split_counts", {})
+    n_classes = len(classes)
+    total_videos = sum(per_class_total.values())
+
+    train_txt = os.path.join(splits_dir, "train.txt")
+    val_txt = os.path.join(splits_dir, "val.txt")
+    test_txt = os.path.join(splits_dir, "test.txt")
+
+    train_size = split_counts.get("train", 0)
+    val_size = split_counts.get("val", 0)
+    test_size = split_counts.get("test", 0)
+
+    per_class_split = split_counts.get("per_class", {})
+
+    train_examples = _head(train_txt, 5)
+    val_examples = _head(val_txt, 5)
+    test_examples = _head(test_txt, 5)
+
+    readme_path = os.path.join(data_root, "README.md")
+    lines = []
+
+    lines.append(f"# Dataset Overview")
+    lines.append("")
+    lines.append(f"- Generated: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"- Root: {os.path.abspath(data_root)}")
+    lines.append(f"- Number of classes: {n_classes}")
+    lines.append(f"- Total videos: {total_videos}")
+    lines.append("")
+    lines.append("## Directory Structure")
+    lines.append("")
+    lines.append("dataset/")
+    lines.append("├─ class_1/")
+    lines.append("├─ class_2/")
+    lines.append("├─ ...")
+    lines.append("├─ splits/")
+    lines.append("│  ├─ train.txt")
+    lines.append("│  ├─ val.txt")
+    lines.append("│  └─ test.txt")
+    lines.append("├─ dataset_info.txt")
+    lines.append("└─ README.md")
+    lines.append("")
+    lines.append("## Classes and Label Indices")
+    for c in classes:
+        idx = class_to_idx.get(c, "NA")
+        count = per_class_total.get(c, 0)
+        pc = per_class_split.get(c, {"train": 0, "val": 0, "test": 0})
+        lines.append(f"- {c} -> {idx} | total={count} (train={pc.get('train',0)}, val={pc.get('val',0)}, test={pc.get('test',0)})")
+    lines.append("")
+    lines.append("## Split Sizes")
+    lines.append(f"- Train: {train_size}")
+    lines.append(f"- Val:   {val_size}")
+    lines.append(f"- Test:  {test_size}")
+    lines.append("")
+    lines.append("## Split File Format")
+    lines.append("- Each line: '<relative_path_from_dataset_root> <label_index>'")
+    lines.append("- Example: 'class_1/video_001.mp4 0'")
+    lines.append("")
+    if train_examples:
+        lines.append("### Examples (train.txt)")
+        for ex in train_examples:
+            lines.append(f"- {ex}")
+        lines.append("")
+    if val_examples:
+        lines.append("### Examples (val.txt)")
+        for ex in val_examples:
+            lines.append(f"- {ex}")
+        lines.append("")
+    if test_examples:
+        lines.append("### Examples (test.txt)")
+        for ex in test_examples:
+            lines.append(f"- {ex}")
+        lines.append("")
+    lines.append("## Regenerating Splits")
+    lines.append("- Re-run the split script to regenerate train/val/test with desired ratios and seed.")
+    lines.append("")
+    lines.append("## Notes")
+    lines.append("- dataset_info.txt is a JSON summary created by the split script.")
+    lines.append("- Paths in split files are relative to the dataset root.")
+    lines.append("")
+
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"README.md written to: {readme_path}")
+
+
+# =======================
+# Main split creation
+# =======================
+def create_splits(
+    data_root: str = DATA_ROOT,
+    splits_dir: str = SPLITS_DIR,
+    train_ratio: float = TRAIN_RATIO,
+    val_ratio: float = VAL_RATIO,
+    test_ratio: float = TEST_RATIO,
+    random_state: int = RANDOM_STATE
+):
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "Ratios must sum to 1.0"
+
+    classes = list_class_dirs(data_root)
+    if not classes:
+        raise RuntimeError(f"No class directories found in {data_root}")
+
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+
+    rng = np.random.default_rng(random_state)
+
+    train_rows = []
+    val_rows = []
+    test_rows = []
+
+    per_class_counts = {}
+    per_class_split_counts = defaultdict(lambda: {"train": 0, "val": 0, "test": 0})
+
+    for c in classes:
+        vids = list_videos_for_class(data_root, c, VIDEO_EXTS)
+        per_class_counts[c] = len(vids)
+
+        t_items, v_items, te_items = stratified_split_per_class(
+            vids, train_ratio, val_ratio, test_ratio, rng
+        )
+
+        lbl = class_to_idx[c]
+        train_rows.extend([(p, lbl) for p in t_items])
+        val_rows.extend([(p, lbl) for p in v_items])
+        test_rows.extend([(p, lbl) for p in te_items])
+
+        per_class_split_counts[c]["train"] += len(t_items)
+        per_class_split_counts[c]["val"] += len(v_items)
+        per_class_split_counts[c]["test"] += len(te_items)
+
+    # Shuffle mixed-class rows
+    rng.shuffle(train_rows)
+    rng.shuffle(val_rows)
+    rng.shuffle(test_rows)
+
+    # Write split files
+    os.makedirs(splits_dir, exist_ok=True)
+    train_txt = os.path.join(splits_dir, "train.txt")
+    val_txt = os.path.join(splits_dir, "val.txt")
+    test_txt = os.path.join(splits_dir, "test.txt")
+
+    write_split_file(train_txt, train_rows)
+    write_split_file(val_txt, val_rows)
+    write_split_file(test_txt, test_rows)
+
+    split_counts_summary = {
+        "train": len(train_rows),
+        "val": len(val_rows),
+        "test": len(test_rows),
+        "per_class": per_class_split_counts
+    }
+
+    # Write dataset_info.txt
+    dataset_info = build_dataset_info(classes, class_to_idx, per_class_counts, split_counts_summary)
+    with open(os.path.join(data_root, "dataset_info.txt"), "w", encoding="utf-8") as f:
+        json.dump(dataset_info, f, indent=2)
+
+    print("Done creating splits.")
+    print(f"Classes ({len(classes)}): {classes}")
+    print(f"Total videos: {sum(per_class_counts.values())}")
+    print(f"Split sizes: train={len(train_rows)}, val={len(val_rows)}, test={len(test_rows)}")
+    print(f"Files written:\n  {train_txt}\n  {val_txt}\n  {test_txt}\n  {os.path.join(data_root, 'dataset_info.txt')}")
+
+    # Create README.md
+    create_readme(data_root, splits_dir)
+
+    # Optional: verify no overlap
+    tr = read_split_file(train_txt)
+    va = read_split_file(val_txt)
+    te = read_split_file(test_txt)
+    verify_no_overlap(tr, va, te)
+
+
+if __name__ == "__main__":
+    # Set DATA_ROOT above, then run this script.
+    create_splits(DATA_ROOT, SPLITS_DIR, TRAIN_RATIO, VAL_RATIO, TEST_RATIO, RANDOM_STATE)
